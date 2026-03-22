@@ -5,9 +5,10 @@ from os import getenv
 load_dotenv()
 import datetime
 
-from discord_utils import split_message
+from discord_utils import split_message, generative_reply
 from core import MiraiAgent
 from core import PhaseTransitionHistoryModel, PhaseDecision
+from agents import Agent
 
 discord_intents = discord.Intents.default()
 discord_intents.message_content = True
@@ -160,6 +161,17 @@ async def tally_votes(interaction: discord.Interaction):
         return
     await interaction.response.send_message("投票を集計して結果を通知します...", ephemeral=True)
     await core.tally_force_votes()
+
+@discord_tree.command(name="generative_reply", description="特定のユーザーにgenerative_replyを実行する")
+async def cmd_generative_reply(interaction: discord.Interaction, target_user: discord.User):
+    await interaction.response.send_message(f"{target_user.global_name} に generative_reply を実行します。", ephemeral=True)
+    try:
+        dm_channel = await target_user.create_dm()
+        channel_desc = f"「{target_user.display_name}（ID {target_user.id}）」とのDM"
+        agent = core.get_chat_agent(target_user, channel_desc)
+        await generative_reply(core, agent, discord_client, dm_channel, core.chat_run_config)
+    except Exception as e:
+        await interaction.followup.send(f"エラーが発生しました: {e}", ephemeral=True)
 
 @discord_client.event
 async def on_ready():

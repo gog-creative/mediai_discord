@@ -253,7 +253,8 @@ class MiraiAgent():
                 for o in self.opinions
                 if o.solution_title == s.title
             ]
-            values.append(sum(relevant) / len(relevant))
+            if relevant:
+                values.append(sum(relevant) / len(relevant))
 
         return max(values) if values else None
 
@@ -817,6 +818,12 @@ class MiraiAgent():
                 await dm_channel.send("申し訳ありません、あなたはこの議論の参加者として登録されていないため、対応できません。")
                 return
 
+        channel_desc = f"「{message.guild.name}」サーバー / 「{message.channel.name}」チャンネル" if message.guild and isinstance(message.channel, discord.abc.GuildChannel) else f"「{message.author.display_name}（ID {message.author.id}）」とのDM"
+        agent = self.get_chat_agent(message.author, channel_desc)
+        await generative_reply(self, agent, self.discord, message, self.chat_run_config)
+
+    def get_chat_agent(self, user: discord.User | discord.Member, channel_desc: str) -> Agent:
+        """指定したユーザーおよびチャンネル状況に応じた適切なAgentを取得する"""
         if self.phase == self.Phase.Proposal:
             template = PHASE0_INSTRUCTION
         elif self.phase == self.Phase.Interview:
@@ -830,7 +837,7 @@ class MiraiAgent():
 
         common_rules = COMMON_RULES.format(
             now=datetime.datetime.now().strftime("%Y/%m/%d %H時%M分%S秒"),
-            channel=f"「{message.guild.name}」サーバー / 「{message.channel.name}」チャンネル" if message.guild and isinstance(message.channel, discord.abc.GuildChannel) else f"「{message.author.display_name}（ID {message.author.id}）」とのDM",
+            channel=channel_desc,
             history_text=self.generate_phase_transition_history_text()
         )
         format_kwargs: dict = {
@@ -838,21 +845,19 @@ class MiraiAgent():
             "agenda": self.agenda or "（まだ議案は登録されていません）",
         }
         if self.phase == self.Phase.Interview:
-            format_kwargs["user_opinion_status"] = self.generate_user_opinion_status(message.author.id)
+            format_kwargs["user_opinion_status"] = self.generate_user_opinion_status(user.id)
         if self.phase == self.Phase.Discussion:
             format_kwargs["opinions_summary"] = self.generate_opinions_summary()
         if self.phase == self.Phase.Voting:
-            format_kwargs["vote_status"] = self.generate_member_vote_status(message.author.id)
+            format_kwargs["vote_status"] = self.generate_member_vote_status(user.id)
 
         system_instruction = template.format(**format_kwargs)
         tools = self.force_vote_tools if self.phase == self.Phase.Voting else self.tools
-        agent = Agent(
+        return Agent(
             name="Chat_Agent",
             instructions=system_instruction,
             tools=list(tools)
         )
-        
-        await generative_reply(self, agent, self.discord, message, self.chat_run_config)
 
 
 # ── AIツール ──────────────────────────────────
