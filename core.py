@@ -18,7 +18,8 @@ from settings import (
     PHASE2_INSTRUCTION, 
     PHASE3_INSTRUCTION, 
     COMMON_RULES, 
-    PHASE_TRANSITION_INSTRUCTION, 
+    PHASE_TRANSITION_INSTRUCTION,
+    REVERT_INSTRUCTION,  
     QUESTION_INSTRUCTION, 
     SUMMARIZE_INSTRUCTION, 
     POSITIVE_VALUE
@@ -102,8 +103,6 @@ class PhaseDecision(Enum):
 class PhaseTransitionModel(BaseModel):
     decision: PhaseDecision = Field(description="判断の内容")
     reason: str = Field(description="その判断に至った理由を具体的に")
-    updated_agenda: Optional[AgendaModel] = Field(description="decisionがAの場合のみ、更新された議案")
-    question_member: Optional[int] = Field(description="decisionがEの場合のみ、質問対象のユーザーID")
 
 # フェーズ遷移履歴用モデル（グローバルスコープ）
 class PhaseTransitionHistoryModel(BaseModel):
@@ -127,6 +126,7 @@ class MiraiAgent():
             update_agenda,
             regist_opinion,
         ]
+        self.mcp_tools: list[Tool] = []  # MCPサーバーから動的に読み込まれるツール
         self.force_vote_tools = [
             regist_force_vote,
         ]
@@ -141,6 +141,11 @@ class MiraiAgent():
         self.phase = self.Phase.Proposal
         self.phase1_count: int = 1  # Phase1を実行した回数
         self.is_ready:bool = False
+        
+        if os.environ.get("LANGSMITH_TRACING", "").lower() == "true":
+            from agents import set_trace_processors
+            from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+            set_trace_processors([OpenAIAgentsTracingProcessor()])
 
         # 会話用
         self.chat_run_config = RunConfig(
@@ -222,7 +227,7 @@ class MiraiAgent():
                             
                             agent_tool.on_invoke_tool = patched_invoke
 
-                        self.tools.append(agent_tool)
+                        self.mcp_tools.append(agent_tool)
                     print(f"   - {server.name} から {len(mcp_raw_tools)} 個のツールを読み込みました")
             else:
                 print("⚠️ 有効な MCP サーバーが見つかりませんでした")
@@ -477,7 +482,7 @@ class MiraiAgent():
                 user_opinion_status=self.generate_user_opinion_status(member.id)
             )
             
-            agent = Agent(name="Phase1_Agent", instructions=system_instruction, tools=list(self.tools))
+            agent = Agent(name="Phase1_Agent", instructions=system_instruction, tools=self.tools+self.mcp_tools)
             await generative_reply(self, agent, self.discord, dm_channel, self.chat_run_config)
 
     async def phase_two(self):
@@ -501,7 +506,7 @@ class MiraiAgent():
                 opinions_summary=opinions_summary,
             )
             # フェーズ2開始のきっかけとなるAIからの第一声を生成させるため、空のメッセージを投げる
-            agent = Agent(name="Phase2_Agent", instructions=system_instruction, tools=list(self.tools))
+            agent = Agent(name="Phase2_Agent", instructions=system_instruction, tools=list(self.tools + self.mcp_tools))
             await generative_reply(self, agent, self.discord, dm_channel, self.chat_run_config)
 
     def _best_positive_solution(self) -> tuple[Optional[str], float]:
@@ -671,18 +676,37 @@ class MiraiAgent():
         if self.agenda is None or not self.opinions:
             return
 
-        prompt: str = PHASE_TRANSITION_INSTRUCTION.format(
+        prompt: str = """
+# 現在の議案
+{agenda}
+
+# メンバーから集まった意見
+{opinions_summary}
+""".format(
             agenda=str(self.agenda),
             opinions_summary=self.generate_opinions_summary()
         )
 
         try:
-            agent = Agent(
-                name="PhaseTransitionDecision",
-                instructions="以下の指示に従い、適切なフェーズ移行を1つ選んでください。",
-                output_type=PhaseTransitionModel
+            revert_agent = Agent(
+                name="RevertToPhase1Agent",
+                instructions=REVERT_INSTRUCTION,
+                output_type=PhaseTransitionModel,
+                tools=[
+                    update_agenda,
+                ],
             )
-            res = await Runner.run(agent, input=prompt, run_config=self.strategy_run_config)
+
+            main_agent = Agent(
+                name="PhaseTransitionDecision",
+                instructions=PHASE_TRANSITION_INSTRUCTION,
+                output_type=PhaseTransitionModel,
+                handoffs=[
+                    revert_agent
+                ],
+                tools=self.mcp_tools + [question_member]
+            )
+            res = await Runner.run(main_agent, input=prompt, run_config=self.strategy_run_config)
 
             if not res.final_output:
                 print("revert_phase: AIから空の応答が返されました")
@@ -693,27 +717,11 @@ class MiraiAgent():
             print(f"Decision: {transition.decision.value}, Reason: {transition.reason}")
             
             if transition.decision == PhaseDecision.REVERT_TO_PHASE1:
-                # フェーズ1に巻き戻る
-                self.phase_transition_history.append(
-                    PhaseTransitionHistoryModel(
-                        decision=transition.decision,
-                        reason=transition.reason,
-                        updated_agenda=transition.updated_agenda
-                    )
-                )
-                await self._archive_and_summarize_opinions()
-                if transition.updated_agenda:
-                    self.agenda = transition.updated_agenda
-                self.phase = self.Phase.Interview
-                self.phase1_count += 1
-                self.save_state()
-
-                notice = f"📢 **議論の状況を踏まえ、フェーズ1（個別ヒアリング）に戻ります。**\n\n**【理由】**\n{transition.reason}"
-                if transition.updated_agenda:
-                    notice += f"\n\n**【議案の更新】**\n議案内容が修正されました。各解決案への意見を再度確認・調整します。"
-                
-                await broadcast_message(notice, self.members)
-                await self.phase_one()
+                # Handoffされたので、ここでは処理しない
+                if self.phase == self.Phase.Interview:
+                    pass
+                else:
+                    print("Aが選ばれましたが、ハンドオフされずに何も実行されませんでした。")
             
             elif transition.decision == PhaseDecision.PROCEED_TO_PHASE3:
                 # フェーズ3へ進む（十分な理解が得られた場合）
@@ -760,34 +768,6 @@ class MiraiAgent():
                 await self.phase_three_force_vote()
 
             elif transition.decision == PhaseDecision.QUESTION_MEMBER:
-                self.phase_transition_history.append(
-                    PhaseTransitionHistoryModel(
-                        decision=transition.decision,
-                        reason=transition.reason
-                    )
-                )
-                assert transition.question_member
-                member = await self.discord.fetch_user(transition.question_member)
-                channel = await member.create_dm()
-
-                # 質問内容をreasonから生成
-                common_rules = COMMON_RULES.format(
-                    now=datetime.datetime.now().strftime("%Y/%m/%d %H時%M分%S秒"),
-                    channel=f"「{member.display_name}（ID {member.id}）」とのDM",
-                    history_text=self.generate_phase_transition_history_text()
-                )
-                system_instruction = QUESTION_INSTRUCTION.format(
-                    common_rules=common_rules,
-                    agenda=self.agenda,
-                    opinions_summary=self.generate_opinions_summary(),
-                    reason=transition.reason
-                )
-                agent = Agent(
-                    name="QuestionMember_Agent",
-                    instructions=system_instruction,
-                    tools=list(self.tools)
-                )
-                await generative_reply(self, agent, self.discord, channel, self.strategy_run_config)
                 print("[decide_next_phase] メンバーに質問したうえで議論を続行。")
                 # 質問後、フェーズ2（議論）へ自動移行
                 self.phase = self.Phase.Discussion
@@ -852,7 +832,7 @@ class MiraiAgent():
             format_kwargs["vote_status"] = self.generate_member_vote_status(user.id)
 
         system_instruction = template.format(**format_kwargs)
-        tools = self.force_vote_tools if self.phase == self.Phase.Voting else self.tools
+        tools = self.force_vote_tools if self.phase == self.Phase.Voting else self.tools + self.mcp_tools
         return Agent(
             name="Chat_Agent",
             instructions=system_instruction,
@@ -875,14 +855,53 @@ def regist_agenda(ctx:RunContextWrapper[MiraiAgent], agenda: AgendaModel) -> str
     return f"「{agenda.title}」議案を登録しました。"
 
 @function_tool
-async def update_agenda(ctx:RunContextWrapper[MiraiAgent], agenda: AgendaModel) -> str:
+async def update_agenda(ctx:RunContextWrapper[MiraiAgent], agenda: AgendaModel, reason: str) -> str:
     """議題とその選択肢を上書き更新する。"""
     ctx.context.agenda = agenda
+    ctx.context.phase_transition_history.append(
+        PhaseTransitionHistoryModel(
+            decision=PhaseDecision.REVERT_TO_PHASE1,
+            reason=reason,
+            updated_agenda=agenda
+        )
+    )
     await ctx.context._archive_and_summarize_opinions()
     ctx.context.phase = ctx.context.Phase.Interview
+    ctx.context.phase1_count += 1
     ctx.context.save_state()
     
+    # 通知送信とフェーズ1開始
+    notice = f"📢 **議論の状況を踏まえ、フェーズ1（個別ヒアリング）に戻ります。**\n\n**【理由】**\n{reason}"    
+    notice += f"\n\n**【議案の更新】**\n議案内容が修正されました。各解決案への意見を再度確認・調整します。"
+    await broadcast_message(notice, ctx.context.members)
+    await ctx.context.phase_one()
+    
     return f"「{agenda.title}」議案を上書き更新しました。"
+
+@function_tool
+async def question_member(ctx:RunContextWrapper[MiraiAgent], member_global_name: str, question_objective: str):
+    """質問エージェントが、特定のユーザーに質問する。フェーズ遷移の判断に必要な情報が不足している場合などに、AIがこのツールを呼び出して質問することが想定される。"""
+
+    member = ctx.context._find_member_by_name(member_global_name)
+    assert member is not None, f"ユーザー「{member_global_name}」が見つかりませんでした。"
+    channel = await member.create_dm()
+
+    # 質問内容をreasonから生成
+    common_rules = COMMON_RULES.format(
+        now=datetime.datetime.now().strftime("%Y/%m/%d %H時%M分%S秒"),
+        channel=f"「{member.display_name}（ID {member.id}）」とのDM",
+        history_text=ctx.context.generate_phase_transition_history_text()
+    )
+
+    agent = Agent(
+        name="QuestionMember_Agent",
+        instructions=QUESTION_INSTRUCTION.format(
+            common_rules=common_rules,
+            reason=question_objective
+        )
+    )
+
+    await generative_reply(ctx.context, agent, ctx.context.discord, channel, ctx.context.strategy_run_config)
 
 @function_tool
 def regist_opinion(

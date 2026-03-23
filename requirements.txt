@@ -1,0 +1,4 @@
+discord
+dotenv
+openai-agents
+langsmith[openai-agents]
