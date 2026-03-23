@@ -99,10 +99,19 @@ class PhaseDecision(Enum):
     FORCE_VOTE = "D"
     QUESTION_MEMBER = "E"
 
+class _PhaseDecision_without_A(Enum):
+    PROCEED_TO_PHASE3 = "B"
+    REPEAT_PHASE2 = "C"
+    FORCE_VOTE = "D"
+    QUESTION_MEMBER = "E"
 
 class PhaseTransitionModel(BaseModel):
-    decision: PhaseDecision = Field(description="判断の内容")
+    decision: _PhaseDecision_without_A = Field(description="判断の内容")
     reason: str = Field(description="その判断に至った理由を具体的に")
+
+class PhaseTransitionRevertModel(BaseModel):
+    reason: str = Field(description="その判断に至った理由を具体的に")
+    agenda: AgendaModel = Field(description="上書きする議案の内容。必要なら内容を更新すること。")
 
 # フェーズ遷移履歴用モデル（グローバルスコープ）
 class PhaseTransitionHistoryModel(BaseModel):
@@ -123,7 +132,6 @@ class MiraiAgent():
     def __init__(self, discord: Client):
         self.tools:list[Tool] = [
             regist_agenda,
-            update_agenda,
             regist_opinion,
         ]
         self.mcp_tools: list[Tool] = []  # MCPサーバーから動的に読み込まれるツール
@@ -691,10 +699,7 @@ class MiraiAgent():
             revert_agent = Agent(
                 name="RevertToPhase1Agent",
                 instructions=REVERT_INSTRUCTION,
-                output_type=PhaseTransitionModel,
-                tools=[
-                    update_agenda,
-                ],
+                output_type=PhaseTransitionRevertModel,
             )
 
             main_agent = Agent(
@@ -712,22 +717,36 @@ class MiraiAgent():
                 print("revert_phase: AIから空の応答が返されました")
                 return
 
-            transition: PhaseTransitionModel = res.final_output
+            transition: PhaseTransitionModel|PhaseTransitionRevertModel = res.final_output
             
-            print(f"Decision: {transition.decision.value}, Reason: {transition.reason}")
+            # フェーズ1へリバート
+            if isinstance(transition, PhaseTransitionRevertModel):
+                self.agenda = transition.agenda
+                self.phase_transition_history.append(
+                    PhaseTransitionHistoryModel(
+                        decision=PhaseDecision.REVERT_TO_PHASE1,
+                        reason=transition.reason,
+                        updated_agenda=transition.agenda
+                    )
+                )
+                await self._archive_and_summarize_opinions()
+                self.phase = self.Phase.Interview
+                self.phase1_count += 1
+                self.save_state()
+                
+                # 通知送信とフェーズ1開始
+                notice = f"📢 **議論の状況を踏まえ、フェーズ1（個別ヒアリング）に戻ります。**\n\n**【理由】**\n{transition.reason}"    
+                notice += f"\n\n**【議案の更新】**\n議案内容が修正されました。各解決案への意見を再度確認・調整します。"
+                await broadcast_message(notice, self.members)
+                await self.phase_one()
+                
+                print(f"「{transition.agenda.title}」議案を上書き更新しました。")
             
-            if transition.decision == PhaseDecision.REVERT_TO_PHASE1:
-                # Handoffされたので、ここでは処理しない
-                if self.phase == self.Phase.Interview:
-                    pass
-                else:
-                    print("Aが選ばれましたが、ハンドオフされずに何も実行されませんでした。")
-            
-            elif transition.decision == PhaseDecision.PROCEED_TO_PHASE3:
+            elif transition.decision.value == PhaseDecision.PROCEED_TO_PHASE3.value:
                 # フェーズ3へ進む（十分な理解が得られた場合）
                 self.phase_transition_history.append(
                     PhaseTransitionHistoryModel(
-                        decision=transition.decision,
+                        decision=PhaseDecision(transition.decision.value),
                         reason=transition.reason
                     )
                 )
@@ -742,11 +761,11 @@ class MiraiAgent():
                     await broadcast_message(notice, self.members)
                     await self.phase_three_force_vote()
             
-            elif transition.decision == PhaseDecision.REPEAT_PHASE2:
+            elif transition.decision.value == PhaseDecision.REPEAT_PHASE2.value:
                 # フェーズ2を再度行う
                 self.phase_transition_history.append(
                     PhaseTransitionHistoryModel(
-                        decision=transition.decision,
+                        decision=PhaseDecision(transition.decision.value),
                         reason=transition.reason
                     )
                 )
@@ -754,11 +773,11 @@ class MiraiAgent():
                 await broadcast_message(notice, self.members)
                 await self.phase_two()
             
-            elif transition.decision == PhaseDecision.FORCE_VOTE:
+            elif transition.decision.value == PhaseDecision.FORCE_VOTE.value:
                 # 強制議決（フェーズ3）を実行
                 self.phase_transition_history.append(
                     PhaseTransitionHistoryModel(
-                        decision=transition.decision,
+                        decision=PhaseDecision(transition.decision.value),
                         reason=transition.reason
                     )
                 )
@@ -767,9 +786,8 @@ class MiraiAgent():
                 await broadcast_message(notice, self.members)
                 await self.phase_three_force_vote()
 
-            elif transition.decision == PhaseDecision.QUESTION_MEMBER:
+            elif transition.decision.value == PhaseDecision.QUESTION_MEMBER.value:
                 print("[decide_next_phase] メンバーに質問したうえで議論を続行。")
-                # 質問後、フェーズ2（議論）へ自動移行
                 self.phase = self.Phase.Discussion
                 await self.phase_two()
 
@@ -855,30 +873,6 @@ def regist_agenda(ctx:RunContextWrapper[MiraiAgent], agenda: AgendaModel) -> str
     return f"「{agenda.title}」議案を登録しました。"
 
 @function_tool
-async def update_agenda(ctx:RunContextWrapper[MiraiAgent], agenda: AgendaModel, reason: str) -> str:
-    """議題とその選択肢を上書き更新する。"""
-    ctx.context.agenda = agenda
-    ctx.context.phase_transition_history.append(
-        PhaseTransitionHistoryModel(
-            decision=PhaseDecision.REVERT_TO_PHASE1,
-            reason=reason,
-            updated_agenda=agenda
-        )
-    )
-    await ctx.context._archive_and_summarize_opinions()
-    ctx.context.phase = ctx.context.Phase.Interview
-    ctx.context.phase1_count += 1
-    ctx.context.save_state()
-    
-    # 通知送信とフェーズ1開始
-    notice = f"📢 **議論の状況を踏まえ、フェーズ1（個別ヒアリング）に戻ります。**\n\n**【理由】**\n{reason}"    
-    notice += f"\n\n**【議案の更新】**\n議案内容が修正されました。各解決案への意見を再度確認・調整します。"
-    await broadcast_message(notice, ctx.context.members)
-    await ctx.context.phase_one()
-    
-    return f"「{agenda.title}」議案を上書き更新しました。"
-
-@function_tool
 async def question_member(ctx:RunContextWrapper[MiraiAgent], member_global_name: str, question_objective: str):
     """質問エージェントが、特定のユーザーに質問する。フェーズ遷移の判断に必要な情報が不足している場合などに、AIがこのツールを呼び出して質問することが想定される。"""
 
@@ -902,6 +896,7 @@ async def question_member(ctx:RunContextWrapper[MiraiAgent], member_global_name:
     )
 
     await generative_reply(ctx.context, agent, ctx.context.discord, channel, ctx.context.strategy_run_config)
+    return f"ユーザー「{member_global_name}」に質問を送信しました。応答があり次第、反映します。"
 
 @function_tool
 def regist_opinion(
@@ -917,7 +912,7 @@ def regist_opinion(
     - member_global_name: 対象ユーザーのグローバル名（display_name / global_name / name のいずれか）
     - solution_title: 対象の解決案タイトル（AgendaModelのsolutionsに存在するものと完全一致）
     - stance: 「絶対なし」「どちらかというとナシ」「中立」「まあいいと思う」「めちゃくちゃいい」のいずれか
-    - comment: スタンスの根拠・懸念（任意）
+    - comment: スタンスの根拠・懸念、その他共有するべき意見等
     """
     if ctx.context.agenda is None:
         return "議案が登録されていないため、意見を記録できません。"
