@@ -6,9 +6,11 @@ load_dotenv()
 import datetime
 
 from discord_utils import split_message, generative_reply
-from core import MiraiAgent
+from core import MiraiAgent, broadcast_message
 from core import PhaseTransitionHistoryModel, PhaseDecision
+from settings import WELCOME_MESSAGE
 from agents import Agent
+
 
 discord_intents = discord.Intents.default()
 discord_intents.message_content = True
@@ -79,6 +81,17 @@ async def opinion_history(interaction:discord.Interaction):
             text += f"  コメント: {op.comment}"
         text += "\n"
     await interaction.response.send_message(text)
+
+@discord_tree.command(name="welcome_message", description="ウェルカムメッセージを一斉送信する")
+async def welcome_message(interaction: discord.Interaction):
+    if not core.is_ready:
+        await interaction.response.send_message("まだ準備ができていません。しばらく待ってから再度お試しください。", ephemeral=True)
+        return
+    for member in core.members:
+        print(member)
+    await broadcast_message(WELCOME_MESSAGE, core.members)
+    await interaction.response.send_message("ウェルカムメッセージを送信しました。", ephemeral=True)
+    
 
 @discord_tree.command(name="start_hearing", description="フェーズ1:ヒアリングを開始する")
 async def start_hearing(interaction: discord.Interaction):

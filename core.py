@@ -13,6 +13,7 @@ import os
 from enum import Enum
 import datetime
 from settings import (
+    WELCOME_MESSAGE,
     PHASE0_INSTRUCTION, 
     PHASE1_INSTRUCTION, 
     PHASE2_INSTRUCTION, 
@@ -474,6 +475,9 @@ class MiraiAgent():
             if best_title is not None:
                 await self.auto_adopt(best_title, best_score)
                 return
+        else:
+            # ウェルカムメッセージを全員に一斉送信（1回目のフェーズ1開始時のみ）
+            await broadcast_message(WELCOME_MESSAGE, self.members)
 
         for member in self.members:
             print(member)
